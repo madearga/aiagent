@@ -1,17 +1,17 @@
 import { createClient } from '@/utils/supabase/server';
 import { NextResponse } from 'next/server';
+import OpenAI from 'openai';
+import Exa from 'exa-js';
+
+const openai = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY,
+});
+
+const exa = new Exa(process.env.EXA_API_KEY as string);
 
 export async function POST(request: Request) {
   const supabase = createClient();
-  let requestBody;
-  try {
-    requestBody = await request.json();
-  } catch (error) {
-    console.error('Error parsing request body:', error);
-    return NextResponse.json({ error: 'Invalid request body' }, { status: 400 });
-  }
-
-  const { message, sessionId, title } = requestBody;
+  const { message, sessionId } = await request.json();
 
   const { data: { user } } = await supabase.auth.getUser();
   if (!user) {
@@ -19,93 +19,106 @@ export async function POST(request: Request) {
   }
 
   try {
-    console.log('Inserting user message:', { sessionId, message, userId: user.id });
-    
-    // Insert user message
-    const { error: userMessageError } = await supabase
-      .from('chat_sessions')
-      .insert({
-        session_id: sessionId,
-        user_id: user.id,
-        title: title || message.substring(0, 50) + '...',
-        sender: 'user',
-        content: message
-      });
-
-    if (userMessageError) {
-      console.error('Error inserting user message:', userMessageError);
-      return NextResponse.json({ error: 'Database operation failed' }, { status: 500 });
-    }
-
-    console.log('Database operation successful, calling Langflow API');
-    
-    // Prepare the request body for Langflow API
-    const langflowRequestBody = {
-      input_value: message,
-      output_type: "chat",
-      input_type: "chat",
-      tweaks: {}
-    };
-    console.log('Langflow API request body:', JSON.stringify(langflowRequestBody, null, 2));
-
-    // Call the Langflow API
-    const response = await fetch(process.env.LANGFLOW_API_URL!, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${process.env.LANGFLOW_API_KEY}`
+    // Search content using Exa
+    const searchResult = await exa.searchAndContents(message, {
+      type: "neural",
+      useAutoprompt: true,
+      numResults: 10,
+      text: {
+        includeHtmlTags: false,
+        maxCharacters: 300
       },
-      body: JSON.stringify(langflowRequestBody)
+      summary: true,
+      headers: {
+        'x-api-key': process.env.EXA_API_KEY as string
+      }
     });
 
-    console.log('Langflow API response status:', response.status);
-    console.log('Langflow API response headers:', JSON.stringify(Object.fromEntries(response.headers), null, 2));
+    // Generate summaries using OpenAI
+    const summariesAndLinks = await Promise.all(searchResult.results.map(async (result: any) => {
+      const summaryResponse = await openai.chat.completions.create({
+        model: "gpt-3.5-turbo",
+        messages: [
+          { role: "system", content: "You are a helpful assistant that summarizes content." },
+          { role: "user", content: `Summarize this content in 2-3 sentences: ${result.text}` }
+        ],
+      });
+      return {
+        summary: summaryResponse.choices[0].message.content || '',
+        link: result.url
+      };
+    }));
 
-    if (!response.ok) {
-      const responseText = await response.text();
-      console.error('Langflow API error:', response.status, responseText);
-      return NextResponse.json({ error: `Langflow API error: ${response.status}` }, { status: 500 });
+    // Create or get session
+    let { data: sessionData, error: sessionError } = await supabase
+      .from('research_sessions')
+      .select('session_id')
+      .eq('session_id', sessionId)
+      .single();
+
+    if (sessionError && sessionError.code === 'PGRST116') {
+      // Session doesn't exist, create it
+      const { data: newSession, error: newSessionError } = await supabase
+        .from('research_sessions')
+        .insert({ session_id: sessionId, session_name: 'New Research Session' })
+        .select('session_id')
+        .single();
+
+      if (newSessionError) throw newSessionError;
+      sessionData = newSession;
+    } else if (sessionError) {
+      throw sessionError;
     }
 
-    let langflowData;
-    try {
-      langflowData = await response.json();
-      console.log('Langflow API response data:', JSON.stringify(langflowData, null, 2));
-    } catch (error) {
-      console.error('Error parsing Langflow API response:', error);
-      return NextResponse.json({ error: 'Invalid response from Langflow API' }, { status: 500 });
-    }
+    // Insert query
+    const { data: queryData, error: queryError } = await supabase
+      .from('queries')
+      .insert({ session_id: sessionData!.session_id, query: message })
+      .select('id')
+      .single();
 
-    let aiMessage = '';
-    if (langflowData.outputs && 
-        langflowData.outputs[0].outputs && 
-        langflowData.outputs[0].outputs[0].messages && 
-        langflowData.outputs[0].outputs[0].messages[0].message) {
-      aiMessage = langflowData.outputs[0].outputs[0].messages[0].message;
+    if (queryError) throw queryError;
 
-      console.log('Saving AI message to Supabase:', aiMessage);
-      // Save AI message to Supabase
-      const { error: aiMessageError } = await supabase
-        .from('chat_sessions')
-        .insert({
-          session_id: sessionId,
-          user_id: user.id,
-          title: title || message.substring(0, 50) + '...',
-          sender: 'ai',
-          content: aiMessage,
-        });
+    // Insert search results
+    const searchResultsInsert = summariesAndLinks.map(item => ({
+      query_id: queryData!.id,
+      summary: item.summary,
+      source_url: item.link
+    }));
 
-      if (aiMessageError) {
-        console.error('Error saving AI message:', aiMessageError);
-      }
-    } else {
-      console.error('Unexpected Langflow API response structure:', JSON.stringify(langflowData, null, 2));
-      return NextResponse.json({ error: 'Unexpected response from Langflow API' }, { status: 500 });
-    }
+    const { error: searchResultsError } = await supabase
+      .from('search_results')
+      .insert(searchResultsInsert);
 
-    return NextResponse.json({ message: aiMessage });
+    if (searchResultsError) throw searchResultsError;
+
+    // Generate an overall summary using OpenAI
+    const summariesText = summariesAndLinks.map(item => item.summary).join('\n');
+    const finalResponse = await openai.chat.completions.create({
+      model: "gpt-3.5-turbo",
+      messages: [
+        { role: "system", content: "You are a helpful research assistant. Summarize the findings and provide insights." },
+        { role: "user", content: `Based on these summaries, provide a concise overall summary of the research topic: ${message}\n\nSummaries:\n${summariesText}` }
+      ],
+    });
+
+    // Insert AI response
+    const { error: aiResponseError } = await supabase
+      .from('ai_responses')
+      .insert({
+        query_id: queryData!.id,
+        response: finalResponse.choices[0].message.content
+      });
+
+    if (aiResponseError) throw aiResponseError;
+
+    return NextResponse.json({ 
+      message: finalResponse.choices[0].message.content,
+      summariesAndLinks: summariesAndLinks
+    });
+
   } catch (error) {
-    console.error('Error in chat API:', error);
-    return NextResponse.json({ error: 'Internal Server Error: ' + (error as Error).message }, { status: 500 });
+    console.error('Error in enhanced chat API:', error);
+    return NextResponse.json({ error: 'Internal Server Error' }, { status: 500 });
   }
 }

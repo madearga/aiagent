@@ -17,14 +17,19 @@ interface Message {
 
 interface ChatSession {
   id: string;
-  title: string;
-  last_message_date: Date;
+  session_name: string;
+  created_at: Date;
 }
 
 interface ChatSessionData {
   session_id: string;
-  title: string;
-  timestamp: string;
+  session_name: string;
+  created_at: string;
+}
+
+interface SummaryAndLink {
+  summary: string;
+  link: string;
 }
 
 const GlowingCard: React.FC<{ children: React.ReactNode; className?: string }> = ({ children, className = "" }) => (
@@ -72,9 +77,9 @@ export default function EnhancedChatPage() {
 
   const fetchChatSessions = async () => {
     const { data, error } = await supabase
-      .from('chat_sessions')
-      .select('session_id, title, timestamp')
-      .order('timestamp', { ascending: false });
+      .from('research_sessions')
+      .select('session_id, session_name, created_at')
+      .order('created_at', { ascending: false });
 
     if (error) {
       console.error('Error fetching chat sessions:', error);
@@ -83,8 +88,8 @@ export default function EnhancedChatPage() {
         if (!acc.find(session => session.id === curr.session_id)) {
           acc.push({
             id: curr.session_id,
-            title: curr.title,
-            last_message_date: new Date(curr.timestamp)
+            session_name: curr.session_name,
+            created_at: new Date(curr.created_at)
           });
         }
         return acc;
@@ -122,7 +127,6 @@ export default function EnhancedChatPage() {
         body: JSON.stringify({
           message: inputMessage,
           sessionId: currentSessionId,
-          title: chatSessions.find(session => session.id === currentSessionId)?.title || inputMessage.substring(0, 50) + '...',
         }),
       });
 
@@ -140,13 +144,23 @@ export default function EnhancedChatPage() {
           timestamp: new Date(),
         };
         setMessages(prevMessages => [...prevMessages, aiResponse]);
+
+        // Display summaries and links
+        data.summariesAndLinks.forEach((item: SummaryAndLink, index: number) => {
+          setMessages(prevMessages => [...prevMessages, {
+            id: uuidv4(),
+            content: `Source ${index + 1}:\nSummary: ${item.summary}\nLink: ${item.link}`,
+            sender: 'ai',
+            timestamp: new Date(),
+          }]);
+        });
       } else {
         throw new Error('No message in response');
       }
 
       fetchChatSessions();
     } catch (error) {
-      console.error('Error calling chat API:', error);
+      console.error('Error calling enhanced chat API:', error);
       setMessages(prevMessages => [...prevMessages, {
         id: uuidv4(),
         content: `Error: ${(error as Error).message}`,
@@ -164,21 +178,41 @@ export default function EnhancedChatPage() {
 
   const loadChatSession = async (sessionId: string) => {
     setCurrentSessionId(sessionId);
-    const { data, error } = await supabase
-      .from('chat_sessions')
-      .select('*')
+    const { data: queriesData, error: queriesError } = await supabase
+      .from('queries')
+      .select('id, query, created_at')
       .eq('session_id', sessionId)
-      .order('timestamp', { ascending: true });
+      .order('created_at', { ascending: true });
 
-    if (error) {
-      console.error('Error loading chat session:', error);
+    if (queriesError) {
+      console.error('Error loading chat session:', queriesError);
     } else {
-      const loadedMessages: Message[] = (data as any[]).map(msg => ({
-        id: msg.id,
-        content: msg.content,
-        sender: msg.sender as 'user' | 'ai',
-        timestamp: new Date(msg.timestamp)
-      }));
+      const loadedMessages: Message[] = [];
+      for (const query of queriesData) {
+        loadedMessages.push({
+          id: query.id,
+          content: query.query,
+          sender: 'user',
+          timestamp: new Date(query.created_at)
+        });
+
+        const { data: responseData, error: responseError } = await supabase
+          .from('ai_responses')
+          .select('response, created_at')
+          .eq('query_id', query.id)
+          .single();
+
+        if (responseError) {
+          console.error('Error loading AI response:', responseError);
+        } else if (responseData) {
+          loadedMessages.push({
+            id: `${query.id}-response`,
+            content: responseData.response,
+            sender: 'ai',
+            timestamp: new Date(responseData.created_at)
+          });
+        }
+      }
       setMessages(loadedMessages);
     }
   };
@@ -214,8 +248,8 @@ export default function EnhancedChatPage() {
                   className="mb-2 p-2 hover:bg-gray-800 rounded cursor-pointer"
                   onClick={() => loadChatSession(session.id)}
                 >
-                  <h3 className="font-medium truncate">{session.title}</h3>
-                  <p className="text-sm text-gray-400">{session.last_message_date.toLocaleDateString()}</p>
+                  <h3 className="font-medium truncate">{session.session_name}</h3>
+                  <p className="text-sm text-gray-400">{session.created_at.toLocaleDateString()}</p>
                 </div>
               ))}
             </div>
